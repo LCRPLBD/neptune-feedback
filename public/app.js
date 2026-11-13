@@ -15,11 +15,8 @@ $('export').onclick=()=>{const csv=['Car,Buff,Nerf,Keep,Total',...cars.map(c=>[J
 
 
 function reviewQuery(prefix){return new URLSearchParams({driver:$(prefix+'Driver').value,experience:$(prefix+'Experience').value,sort:$(prefix+'Sort').value}).toString();}
-let driverPage=0,driverRequest=0;
-async function loadDrivers(append=false){const ticket=++driverRequest;$('driverStatus').textContent='Loading feedback…';try{const data=await api('/api/feedback?'+reviewQuery('driver')+'&page='+driverPage);if(ticket!==driverRequest)return;if(!append)$('driverList').replaceChildren();$('driverStatus').textContent=data.total+' matching reviews';$('moreDrivers').hidden=(driverPage+1)*50>=data.total;for(const item of data.items){const entry=el('article',undefined,'entry'),head=el('div',undefined,'entry-head'),carButton=el('button',item.car+' ↗','quiet');carButton.onclick=()=>openCar(item.car);head.append(el('strong',item.name),el('span',item.verdict.toUpperCase(),'badge '+item.verdict));entry.append(head,carButton,el('div','Experience: '+(item.experience||'Not specified'),'experience-badge'),el('time',new Date(item.created).toLocaleString()),el('p',item.notes));$('driverList').append(entry);}}catch(e){if(ticket===driverRequest)$('driverStatus').textContent=e.message;}}
-for(const prefix of ['driver']){let timer;for(const suffix of ['Driver','Experience','Sort'])$(prefix+suffix).addEventListener(suffix==='Driver'?'input':'change',()=>{clearTimeout(timer);if(prefix==='car')request++;else driverRequest++;timer=setTimeout(()=>{if(prefix==='car'){page=0;history();}else{driverPage=0;loadDrivers();}},suffix==='Driver'?250:0);});}
+for(const suffix of ['Driver','Experience','Sort'])$('driver'+suffix).addEventListener(suffix==='Driver'?'input':'change',()=>{page=0;request++;if(current)history();});
 $('editSearch').onclick=()=>{$('carDialog').close();document.querySelector('.search-panel').scrollIntoView({behavior:'smooth',block:'start'});$('driverDriver').focus({preventScroll:true});};
-$('moreDrivers').onclick=()=>{driverPage++;loadDrivers(true);};
-$('acceptNotice').onclick=()=>$('notice').close();$('notice').showModal();loadDrivers();
+$('acceptNotice').onclick=()=>$('notice').close();$('notice').showModal();
 
 document.querySelectorAll('[data-experience]').forEach(button=>button.onclick=()=>{$('driverExperience').value=button.dataset.experience;document.querySelectorAll('[data-experience]').forEach(x=>{x.classList.toggle('active',x===button);x.setAttribute('aria-pressed',String(x===button));});$('driverExperience').dispatchEvent(new Event('change'));});

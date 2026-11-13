@@ -10,6 +10,10 @@ export function createApp({dataDir=process.env.DATA_DIR||join(root,'data'),rateL
  mkdirSync(dataDir,{recursive:true});const db=new DatabaseSync(join(dataDir,'feedback.sqlite'));
  db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS feedback(id TEXT PRIMARY KEY,car TEXT NOT NULL,verdict TEXT NOT NULL CHECK(verdict IN ('buff','nerf','keep')),name TEXT NOT NULL,notes TEXT NOT NULL,created TEXT NOT NULL); CREATE INDEX IF NOT EXISTS feedback_car ON feedback(car,created);");
  if(!db.prepare('PRAGMA table_info(feedback)').all().some(c=>c.name==='experience')){db.exec("ALTER TABLE feedback ADD COLUMN experience TEXT NOT NULL DEFAULT 'Not specified'");}
+ // Owner-requested review removal. Archive it privately before removing it from public results.
+ db.exec("CREATE TABLE IF NOT EXISTS removed_feedback AS SELECT * FROM feedback WHERE 0");
+ db.exec('BEGIN IMMEDIATE');
+ try {const removedId='b10f5b80-ed8e-4ee0-86b1-5a2fb2cbc7e6';db.prepare('INSERT INTO removed_feedback SELECT * FROM feedback WHERE id=?').run(removedId);db.prepare('DELETE FROM feedback WHERE id=?').run(removedId);db.exec('COMMIT');}catch(error){db.exec('ROLLBACK');throw error;}
  const levels=['Beginner','Novice','Intermediate','Advanced','Expert'];
  const insert=db.prepare('INSERT INTO feedback(id,car,verdict,name,notes,created,experience) VALUES(?,?,?,?,?,?,?)'),groups=db.prepare('SELECT car,verdict,count(*) AS n FROM feedback GROUP BY car,verdict'),feed=db.prepare('SELECT * FROM feedback WHERE car=? ORDER BY created DESC,id DESC LIMIT ? OFFSET ?'),count=db.prepare('SELECT count(*) AS n FROM feedback WHERE car=?');
  const limits=new Map(),salt=randomBytes(16).toString('hex');const files={'/':'index.html','/app.js':'app.js','/style.css':'style.css','/config.js':'config.js'};
@@ -26,4 +30,5 @@ export function createApp({dataDir=process.env.DATA_DIR||join(root,'data'),rateL
  server.on('close',()=>db.close());return server;
 }
 if(process.argv[1]&&fileURLToPath(import.meta.url)===process.argv[1]){const port=Number(process.env.PORT||32010);createApp().listen(port,'0.0.0.0',()=>console.log('Neptune Feedback listening on '+port));}
+
 

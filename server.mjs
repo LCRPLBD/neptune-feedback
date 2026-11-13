@@ -1,12 +1,13 @@
 import http from 'node:http';
+import {blockedContent} from './moderation.mjs';
 import {readFileSync,mkdirSync} from 'node:fs';
 import {join,dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {DatabaseSync} from 'node:sqlite';
-import {randomUUID,createHash,randomBytes} from 'node:crypto';
+import {randomUUID,createHash,randomBytes,scryptSync,timingSafeEqual} from 'node:crypto';
 const root=dirname(fileURLToPath(import.meta.url));
 export const cars=JSON.parse(readFileSync(join(root,'cars.json'),'utf8').replace(/^\uFEFF/,''));
-export function createApp({dataDir=process.env.DATA_DIR||join(root,'data'),rateLimit=true}={}){
+export function createApp({dataDir=process.env.DATA_DIR||join(root,'data'),rateLimit=true,moderatorPassword=process.env.MODERATOR_PASSWORD}={}){
  mkdirSync(dataDir,{recursive:true});const db=new DatabaseSync(join(dataDir,'feedback.sqlite'));
  db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS feedback(id TEXT PRIMARY KEY,car TEXT NOT NULL,verdict TEXT NOT NULL CHECK(verdict IN ('buff','nerf','keep')),name TEXT NOT NULL,notes TEXT NOT NULL,created TEXT NOT NULL); CREATE INDEX IF NOT EXISTS feedback_car ON feedback(car,created);");
  if(!db.prepare('PRAGMA table_info(feedback)').all().some(c=>c.name==='experience')){db.exec("ALTER TABLE feedback ADD COLUMN experience TEXT NOT NULL DEFAULT 'Not specified'");}
@@ -14,15 +15,40 @@ export function createApp({dataDir=process.env.DATA_DIR||join(root,'data'),rateL
  db.exec("CREATE TABLE IF NOT EXISTS removed_feedback AS SELECT * FROM feedback WHERE 0");
  db.exec('BEGIN IMMEDIATE');
  try {const removedId='b10f5b80-ed8e-4ee0-86b1-5a2fb2cbc7e6';db.prepare('INSERT INTO removed_feedback SELECT * FROM feedback WHERE id=?').run(removedId);db.prepare('DELETE FROM feedback WHERE id=?').run(removedId);db.exec('COMMIT');}catch(error){db.exec('ROLLBACK');throw error;}
+ const sessions=new Map(),loginAttempts=new Map(),passwordSalt=randomBytes(32),passwordHash=moderatorPassword?scryptSync(moderatorPassword,passwordSalt,64):null;
+ const digest=value=>createHash('sha256').update(value).digest('hex');
+ const moderator=req=>{const token=String(req.headers.authorization||'').replace(/^Bearer /,'');const session=sessions.get(digest(token));if(!session||session<Date.now()){sessions.delete(digest(token));return false;}return true;};
+ const revision=car=>{const ids=db.prepare('SELECT id FROM feedback WHERE car=? ORDER BY id').all(car).map(x=>x.id);return {count:ids.length,revision:digest(ids.join(','))};};
+ db.exec('CREATE TABLE IF NOT EXISTS moderation_audit(id TEXT PRIMARY KEY,action TEXT,car TEXT,review_id TEXT,created TEXT)');
+ const archive=(where,params,action,car,reviewId)=>{db.exec('BEGIN IMMEDIATE');try{db.prepare('INSERT INTO removed_feedback SELECT * FROM feedback WHERE '+where).run(...params);const result=db.prepare('DELETE FROM feedback WHERE '+where).run(...params);db.prepare('INSERT INTO moderation_audit VALUES(?,?,?,?,?)').run(randomUUID(),action,car,reviewId,new Date().toISOString());db.exec('COMMIT');return result.changes;}catch(e){db.exec('ROLLBACK');throw e;}};
  const levels=['Beginner','Novice','Intermediate','Advanced','Expert'];
  const insert=db.prepare('INSERT INTO feedback(id,car,verdict,name,notes,created,experience) VALUES(?,?,?,?,?,?,?)'),groups=db.prepare('SELECT car,verdict,count(*) AS n FROM feedback GROUP BY car,verdict'),feed=db.prepare('SELECT * FROM feedback WHERE car=? ORDER BY created DESC,id DESC LIMIT ? OFFSET ?'),count=db.prepare('SELECT count(*) AS n FROM feedback WHERE car=?');
  const limits=new Map(),salt=randomBytes(16).toString('hex');const files={'/':'index.html','/app.js':'app.js','/style.css':'style.css','/config.js':'config.js'};
  const server=http.createServer(async(req,res)=>{res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','strict-origin-when-cross-origin');res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' https:; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");res.setHeader('Cache-Control','no-store');const send=(code,obj)=>{res.writeHead(code,{'Content-Type':'application/json; charset=utf-8'});res.end(JSON.stringify(obj));};
- try{const url=new URL(req.url,'http://localhost');const origin=req.headers.origin;const allowed=(process.env.ALLOWED_ORIGINS||'https://lcrplbd.github.io').split(',').map(s=>s.trim()).filter(Boolean);const self=origin&&new URL(origin).host===req.headers.host;if(origin&&(self||allowed.includes(origin))){res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Vary','Origin');res.setHeader('Access-Control-Allow-Methods','GET,POST,OPTIONS');res.setHeader('Access-Control-Allow-Headers','Content-Type');}if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}
+ try{const url=new URL(req.url,'http://localhost');const origin=req.headers.origin;const allowed=(process.env.ALLOWED_ORIGINS||'https://lcrplbd.github.io').split(',').map(s=>s.trim()).filter(Boolean);const self=origin&&new URL(origin).host===req.headers.host;if(origin&&(self||allowed.includes(origin))){res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Vary','Origin');res.setHeader('Access-Control-Allow-Methods','GET,POST,OPTIONS');res.setHeader('Access-Control-Allow-Headers','Content-Type,Authorization');}if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}
+ if(url.pathname.startsWith('/api/mod/')){
+ if(req.method==='GET'){if(!moderator(req)){send(401,{error:'Please log in as a moderator.'});return;}if(url.pathname==='/api/mod/session'){send(200,{username:'Neutren'});return;}if(url.pathname==='/api/mod/summary'){const car=url.searchParams.get('car');if(!cars.includes(car)){send(404,{error:'Car not found.'});return;}send(200,revision(car));return;}}
+ if(req.method!=='POST'){send(404,{error:'Not found.'});return;}
+ if(!origin||(!self&&!allowed.includes(origin))){send(403,{error:'Invalid request origin.'});return;}
+ if(!req.headers['content-type']?.startsWith('application/json')){send(415,{error:'JSON required.'});return;}
+ let raw='';for await(const part of req){raw+=part;if(Buffer.byteLength(raw)>12000){send(413,{error:'Request too large.'});return;}}let input;try{input=JSON.parse(raw);if(!input||Array.isArray(input)||typeof input!=='object')throw Error();}catch{send(400,{error:'Invalid request.'});return;}
+ if(url.pathname==='/api/mod/login'){
+ if(!passwordHash){send(503,{error:'Moderator login is awaiting server configuration.'});return;}
+ const key=digest(String(req.headers['x-forwarded-for']||req.socket.remoteAddress)),now=Date.now();for(const [k,v] of loginAttempts)if(v.until<now)loginAttempts.delete(k);const attempts=loginAttempts.get(key)||{count:0,until:now+15*60*1000};if(attempts.count>=5){send(429,{error:'Too many login attempts. Try again in 15 minutes.'});return;}attempts.count++;loginAttempts.set(key,attempts);
+ const candidate=typeof input.password==='string'&&input.password.length<=256?input.password:'';const valid=timingSafeEqual(passwordHash,scryptSync(candidate,passwordSalt,64));if(String(input.username||'').trim().toLowerCase()!=='neutren'||!valid){send(401,{error:'Incorrect username or password.'});return;}
+ loginAttempts.delete(key);for(const [k,v] of sessions)if(v<now)sessions.delete(k);const token=randomBytes(32).toString('hex');sessions.set(digest(token),now+8*60*60*1000);send(200,{token,username:'Neutren'});return;
+ }
+ if(!moderator(req)){send(401,{error:'Your moderator session expired. Please log in again.'});return;}
+ if(url.pathname==='/api/mod/logout'){sessions.delete(digest(String(req.headers.authorization||'').replace(/^Bearer /,'')));send(200,{ok:true});return;}
+ if(url.pathname==='/api/mod/remove'){const row=db.prepare('SELECT * FROM feedback WHERE id=?').get(String(input.id||''));if(!row){send(404,{error:'That review has already been removed.'});return;}send(200,{removed:archive('id=?',[row.id],'remove',row.car,row.id)});return;}
+ if(url.pathname==='/api/mod/clear'){if(!cars.includes(input.car)){send(400,{error:'Choose a valid car.'});return;}const state=revision(input.car);if(input.revision!==state.revision){send(409,{error:'Feedback changed since confirmation. Review the updated total and try again.'});return;}send(200,{removed:archive('car=?',[input.car],'tuned-clear',input.car,null)});return;}
+ send(404,{error:'Not found.'});return;
+ }
  if(req.method==='GET'&&url.pathname==='/api/health'){send(200,{ok:true});return;}
  if(req.method==='GET'&&url.pathname==='/api/cars'){const result=cars.map(name=>({name,buff:0,nerf:0,keep:0,total:0}));const map=new Map(result.map(c=>[c.name,c]));for(const row of groups.all()){const c=map.get(row.car);if(c){c[row.verdict]=row.n;c.total+=row.n;}}send(200,{cars:result});return;}
  if(req.method==='GET'&&url.pathname==='/api/feedback'){const car=url.searchParams.get('car'),driver=(url.searchParams.get('driver')||'').trim().slice(0,80),experience=url.searchParams.get('experience')||'',sort=url.searchParams.get('sort')||'newest';if(car&&!cars.includes(car)){send(404,{error:'Car not found.'});return;}const where=[],params=[];if(car){where.push('car=?');params.push(car);}if(driver){where.push('instr(lower(name),lower(?))>0');params.push(driver);}if(experience){where.push('experience=?');params.push(experience);}const clause=where.length?' WHERE '+where.join(' AND '):'';const rank="CASE experience WHEN 'Beginner' THEN 1 WHEN 'Novice' THEN 2 WHEN 'Intermediate' THEN 3 WHEN 'Advanced' THEN 4 WHEN 'Expert' THEN 5 ELSE 0 END";const order=sort==='experience-high'?"(experience='Not specified') ASC,"+rank+' DESC,':sort==='experience-low'?"(experience='Not specified') ASC,"+rank+' ASC,':'';const page=Math.max(0,Math.min(100000,Math.floor(Number(url.searchParams.get('page'))||0)));send(200,{items:db.prepare('SELECT * FROM feedback'+clause+' ORDER BY '+order+'created DESC,id DESC LIMIT 50 OFFSET ?').all(...params,page*50),total:db.prepare('SELECT count(*) AS n FROM feedback'+clause).get(...params).n,page});return;}
  if(req.method==='POST'&&url.pathname==='/api/feedback'){if(!origin||(!self&&!allowed.includes(origin))){send(403,{error:'Please submit from the feedback website.'});return;}if(!req.headers['content-type']?.startsWith('application/json')){send(415,{error:'JSON required.'});return;}let body='';for await(const part of req){body+=part;if(Buffer.byteLength(body)>12000){send(413,{error:'Feedback is too long.'});return;}}let b;try{b=JSON.parse(body);}catch{send(400,{error:'Invalid feedback.'});return;}const experience=b.experience||'Not specified';if(experience!=='Not specified'&&!levels.includes(experience)){send(400,{error:'Choose a valid driver experience level.'});return;}const {car,verdict}=b,name=typeof b.name==='string'?b.name.trim():'',notes=typeof b.notes==='string'?b.notes.trim():'';if(!cars.includes(car)||!['buff','nerf','keep'].includes(verdict)||!name||name.length>40||!notes||notes.length>2000||b.website){send(400,{error:'Choose a car and verdict, enter a name (1–40 characters) and notes (1–2,000 characters).'});return;}
+ if(blockedContent(name)||blockedContent(notes)){send(400,{error:'Please revise your name or notes: abusive, hateful, sexually explicit or threatening wording is not allowed.'});return;}
  const ip=String(req.headers['x-forwarded-for']||req.socket.remoteAddress).split(',').pop().trim(),key=createHash('sha256').update(salt+ip).digest('hex'),now=Date.now();if(limits.size>10000)for(const [k,v] of limits)if(v.until<now)limits.delete(k);const l=limits.get(key)||{count:0,until:now+60000};if(l.until<now){l.count=0;l.until=now+60000;}if(rateLimit&&l.count>=8){res.setHeader('Retry-After','60');send(429,{error:'A little too fast. Please wait a minute before posting again.'});return;}l.count++;limits.set(key,l);
  const item={id:randomUUID(),car,verdict,name,notes,experience,created:new Date().toISOString()};insert.run(item.id,car,verdict,name,notes,item.created,experience);send(201,item);return;}
  if(req.method==='GET'&&files[url.pathname]){const f=files[url.pathname];res.setHeader('Content-Type',f.endsWith('.js')?'text/javascript; charset=utf-8':f.endsWith('.css')?'text/css; charset=utf-8':'text/html; charset=utf-8');res.end(readFileSync(join(root,'public',f)));return;}send(404,{error:'Not found.'});
@@ -30,5 +56,4 @@ export function createApp({dataDir=process.env.DATA_DIR||join(root,'data'),rateL
  server.on('close',()=>db.close());return server;
 }
 if(process.argv[1]&&fileURLToPath(import.meta.url)===process.argv[1]){const port=Number(process.env.PORT||32010);createApp().listen(port,'0.0.0.0',()=>console.log('Neptune Feedback listening on '+port));}
-
 

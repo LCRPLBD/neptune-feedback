@@ -1,0 +1,6 @@
+// Conservative English word/phrase filter, not a guarantee of platform compliance.
+const words=['nigger','nigga','faggot','kike','chink','spic','tranny','retard','retarded','cunt','fuck','fucking','motherfucker','bitch','asshole','porn','porno','pornography','hentai','blowjob','handjob','cumshot','rape','rapist'];
+const phrases=['kill yourself','go kill yourself','i will kill you','i will rape you','send nudes','heil hitler','gas the jews','white power'];
+const map={'0':'o','1':'i','3':'e','4':'a','5':'s','7':'t','@':'a','$':'s','а':'a','е':'e','і':'i','о':'o','с':'c','р':'p','х':'x','у':'y'};
+export function blockedContent(value){const normalized=String(value).normalize('NFKD').toLowerCase().replace(/[\u0300-\u036f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g,'').replace(/[013457@$аеіосрху]/g,c=>map[c]).replace(/(.)\1{2,}/g,'$1$1');const flat=normalized.replace(/[^a-z\s]/g,' ').replace(/\s+/g,' ').trim();if(/\bkys\b/.test(flat))return true;for(const word of words){const letters=word.split('').join('[^a-z]*');if(new RegExp('(?:^|[^a-z])'+letters+'(?:s)?(?:$|[^a-z])').test(normalized))return true;}return phrases.some(p=>flat.includes(p)||normalized.replace(/[^a-z]/g,'').includes(p.replace(/ /g,'')));}
+
